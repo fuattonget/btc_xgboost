@@ -13,10 +13,13 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
 - Walk-forward (embargo'lu) train/test ayrımı ve TimeSeriesSplit ile periyodik
   hiperparametre seçimi yapar
 - Tahmin geçmişini SQLite'a kalıcı olarak kaydeder (uygulama/sunucu yeniden başlasa bile kaybolmaz)
-- Sonuçlanmış tahminleri periyodik olarak GitHub'daki ayrı bir `data` branch'ine CSV olarak
-  senkronize eder (deploy edilen `main` branch'ini TETİKLEMEZ) — böylece canlı doğruluk
-  sonuçları repo üzerinden dışarıdan da takip edilebilir. `GITHUB_TOKEN` secret'ı tanımlı
-  değilse bu adım sessizce atlanır, uygulamanın geri kalanını etkilemez.
+- Her gerçek model eğitiminde (cache miss olduğunda) kullanılan hiperparametreleri, test
+  seti hata oranlarını (MAE/RMSE/naive'e karşı edge, yön isabeti) ve modelin en çok neye
+  baktığını (özellik önem sırası) SQLite'a loglar
+- Sonuçlanmış tahminleri ve eğitim loglarını periyodik olarak GitHub'daki ayrı bir `data`
+  branch'ine CSV olarak senkronize eder (deploy edilen `main` branch'ini TETİKLEMEZ) —
+  böylece canlı sonuçlar repo üzerinden dışarıdan da takip edilebilir. `GITHUB_TOKEN`
+  secret'ı tanımlı değilse bu adım sessizce atlanır, uygulamanın geri kalanını etkilemez.
 - Her 2 dakikada bir otomatik olarak verileri yeniler ve modeli yeniden eğitir
 
 Çalıştırmak için:
@@ -25,6 +28,7 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
 """
 
 import base64
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +73,7 @@ DB_PATH = Path(__file__).resolve().parent / "predictions.db"
 GITHUB_REPO = "fuattonget/btc_xgboost"
 GITHUB_DATA_BRANCH = "data"
 GITHUB_DATA_PATH = "data/predictions_log.csv"
+GITHUB_TRAINING_PATH = "data/training_log.csv"
 GITHUB_SYNC_MIN_INTERVAL_MIN = 10
 
 DEFAULT_PARAM_GRID = [
@@ -405,6 +410,10 @@ def train_model(feat_df: pd.DataFrame, horizon: int, params: dict):
         "clf_test_acc": clf_test_acc,
     }
 
+    reg_importance = pd.Series(reg.feature_importances_, index=FEATURE_COLS).sort_values(ascending=False).head(15)
+    clf_importance = pd.Series(clf.feature_importances_, index=FEATURE_COLS).sort_values(ascending=False).head(15)
+    log_training_run(horizon, params, len(train), metrics, reg_importance, clf_importance)
+
     return {
         "model": reg,
         "clf_model": clf,
@@ -495,7 +504,65 @@ def get_db_connection() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS training_runs (
+            run_time TEXT PRIMARY KEY,
+            horizon INTEGER NOT NULL,
+            max_depth INTEGER NOT NULL,
+            learning_rate REAL NOT NULL,
+            n_estimators INTEGER NOT NULL,
+            n_train INTEGER NOT NULL,
+            n_test INTEGER NOT NULL,
+            mae REAL NOT NULL,
+            rmse REAL NOT NULL,
+            mae_naive REAL NOT NULL,
+            edge_vs_naive_pct REAL NOT NULL,
+            direction_acc REAL NOT NULL,
+            clf_test_acc REAL NOT NULL,
+            reg_feature_importance TEXT NOT NULL,
+            clf_feature_importance TEXT NOT NULL
+        )
+        """
+    )
     return conn
+
+
+def log_training_run(horizon: int, params: dict, n_train: int, metrics: dict,
+                      reg_importance: pd.Series, clf_importance: pd.Series) -> None:
+    """Her GERÇEK model eğitiminde (train_model'in cache miss olduğu her seferde) çağrılır:
+    kullanılan hiperparametreleri, test seti hata oranlarını ve her iki modelin en çok
+    hangi özelliklere baktığını (importance) SQLite'a kalıcı olarak kaydeder."""
+    run_time = pd.Timestamp.now(tz="UTC").isoformat()
+    conn = get_db_connection()
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO training_runs "
+            "(run_time, horizon, max_depth, learning_rate, n_estimators, n_train, n_test, "
+            " mae, rmse, mae_naive, edge_vs_naive_pct, direction_acc, clf_test_acc, "
+            " reg_feature_importance, clf_feature_importance) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_time, horizon,
+                params["max_depth"], params["learning_rate"], params["n_estimators"],
+                n_train, metrics["n_test"],
+                metrics["mae"], metrics["rmse"], metrics["mae_naive"], metrics["edge_vs_naive_pct"],
+                metrics["direction_acc"], metrics["clf_test_acc"],
+                json.dumps(reg_importance.round(6).to_dict()),
+                json.dumps(clf_importance.round(6).to_dict()),
+            ),
+        )
+    conn.close()
+
+
+def load_training_runs(limit: int | None = None) -> pd.DataFrame:
+    conn = get_db_connection()
+    query = "SELECT * FROM training_runs ORDER BY run_time DESC"
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
 
 def log_new_prediction(latest_time: pd.Timestamp, current_price: float,
@@ -562,8 +629,27 @@ def _set_sync_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         )
 
 
-def sync_predictions_to_github() -> None:
-    """Sonuçlanmış tahmin geçmişini GitHub'daki ayrı `data` branch'ine CSV olarak push eder.
+def _push_csv_to_github(token: str, path: str, df: pd.DataFrame, message: str) -> bool:
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    content_b64 = base64.b64encode(csv_bytes).decode("ascii")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+    get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_DATA_BRANCH}, timeout=10)
+    sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+
+    payload = {"message": message, "content": content_b64, "branch": GITHUB_DATA_BRANCH}
+    if sha:
+        payload["sha"] = sha
+
+    put_resp = requests.put(api_url, headers=headers, json=payload, timeout=15)
+    return put_resp.status_code in (200, 201)
+
+
+def sync_logs_to_github() -> None:
+    """Sonuçlanmış tahmin geçmişini VE model eğitim loglarını (hiperparametreler, hata
+    oranları, özellik önem sırası) GitHub'daki ayrı `data` branch'ine iki ayrı CSV olarak
+    push eder: `data/predictions_log.csv` ve `data/training_log.csv`.
 
     Bilerek deploy edilen `main` DEĞİL, ayrı bir `data` branch'i hedeflenir: Streamlit Cloud
     yalnızca app'e bağlı branch'e (main) push geldiğinde otomatik redeploy tetikler; `data`
@@ -592,34 +678,30 @@ def sync_predictions_to_github() -> None:
     resolved = pd.read_sql_query(
         "SELECT * FROM predictions WHERE resolved = 1 ORDER BY pred_time ASC", conn
     )
-    if resolved.empty:
-        conn.close()
+    training = pd.read_sql_query("SELECT * FROM training_runs ORDER BY run_time ASC", conn)
+    conn.close()
+
+    if resolved.empty and training.empty:
         return
 
     try:
-        csv_bytes = resolved.to_csv(index=False).encode("utf-8")
-        content_b64 = base64.b64encode(csv_bytes).decode("ascii")
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DATA_PATH}"
-
-        get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_DATA_BRANCH}, timeout=10)
-        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
-
-        payload = {
-            "message": f"Update prediction log ({len(resolved)} resolved predictions)",
-            "content": content_b64,
-            "branch": GITHUB_DATA_BRANCH,
-        }
-        if sha:
-            payload["sha"] = sha
-
-        put_resp = requests.put(api_url, headers=headers, json=payload, timeout=15)
-        if put_resp.status_code in (200, 201):
-            _set_sync_state(conn, "last_synced_at", now.isoformat())
+        ok = True
+        if not resolved.empty:
+            ok = _push_csv_to_github(
+                token, GITHUB_DATA_PATH, resolved,
+                f"Update prediction log ({len(resolved)} resolved predictions)",
+            ) and ok
+        if not training.empty:
+            ok = _push_csv_to_github(
+                token, GITHUB_TRAINING_PATH, training,
+                f"Update training log ({len(training)} runs)",
+            ) and ok
+        if ok:
+            sync_conn = get_db_connection()
+            _set_sync_state(sync_conn, "last_synced_at", now.isoformat())
+            sync_conn.close()
     except Exception:
         pass  # best-effort: senkronizasyon hatası canlı uygulamayı etkilemesin
-    finally:
-        conn.close()
 
 
 def render_countdown_and_forecast_widget(target_time: pd.Timestamp, current_price: float,
@@ -725,7 +807,7 @@ future_up_prob = result["future_up_prob"] if result else None
 # ---- Tahmin doğruluk takibi: önce geçmiş tahminleri sonuçlandır, sonra yenisini kaydet
 resolve_pending_predictions(feat_df)
 log_new_prediction(latest.name, latest["close"], future_pred)
-sync_predictions_to_github()
+sync_logs_to_github()
 
 # ---- Üst metrik satırı --------------------------------------------------
 current_price = latest["close"]
@@ -797,6 +879,38 @@ with st.expander("🔧 Hiperparametre Seçimi (Walk-Forward CV, 30 dk'da bir yen
     )
     st.dataframe(cv_report, hide_index=True, use_container_width=True)
     st.write(f"**Seçilen parametreler:** {best_params}")
+
+with st.expander("📚 Eğitim Geçmişi (Hiperparametreler, Hata Oranları, Özellik Önemi) — SQLite'ta kalıcı"):
+    st.caption(
+        "Her gerçek model eğitiminde (yeni mum verisi geldiğinde) otomatik loglanır — "
+        "widget etkileşimlerinde tekrar eğitim yapılmadığı için tekrar loglanmaz. "
+        "Bu geçmiş `data` branch'indeki `data/training_log.csv` dosyasına da senkronize edilir."
+    )
+    runs_df = load_training_runs(limit=20)
+    if runs_df.empty:
+        st.info("Henüz loglanmış bir eğitim koşusu yok.")
+    else:
+        display_runs = runs_df.copy()
+        display_runs["Zaman (UTC)"] = pd.to_datetime(display_runs["run_time"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        display_runs["Hiperparametreler"] = display_runs.apply(
+            lambda r: f"depth={r['max_depth']}, lr={r['learning_rate']}, n_est={r['n_estimators']}", axis=1
+        )
+        display_runs["MAE (Naive'e Karşı)"] = display_runs.apply(
+            lambda r: f"${r['mae']:,.2f} ({r['edge_vs_naive_pct']:+.1f}% / naive: ${r['mae_naive']:,.2f})", axis=1
+        )
+        display_runs["Yön İsabeti (Reg / Clf)"] = display_runs.apply(
+            lambda r: f"%{r['direction_acc']*100:.1f} / %{r['clf_test_acc']*100:.1f}", axis=1
+        )
+        display_runs["En Çok Baktığı 5 Özellik"] = display_runs["reg_feature_importance"].apply(
+            lambda s: ", ".join(list(json.loads(s).keys())[:5])
+        )
+        st.dataframe(
+            display_runs[[
+                "Zaman (UTC)", "Hiperparametreler", "MAE (Naive'e Karşı)",
+                "Yön İsabeti (Reg / Clf)", "En Çok Baktığı 5 Özellik",
+            ]],
+            hide_index=True, use_container_width=True,
+        )
 
 st.divider()
 
