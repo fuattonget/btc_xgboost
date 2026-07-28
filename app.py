@@ -13,6 +13,10 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
 - Walk-forward (embargo'lu) train/test ayrımı ve TimeSeriesSplit ile periyodik
   hiperparametre seçimi yapar
 - Tahmin geçmişini SQLite'a kalıcı olarak kaydeder (uygulama/sunucu yeniden başlasa bile kaybolmaz)
+- Sonuçlanmış tahminleri periyodik olarak GitHub'daki ayrı bir `data` branch'ine CSV olarak
+  senkronize eder (deploy edilen `main` branch'ini TETİKLEMEZ) — böylece canlı doğruluk
+  sonuçları repo üzerinden dışarıdan da takip edilebilir. `GITHUB_TOKEN` secret'ı tanımlı
+  değilse bu adım sessizce atlanır, uygulamanın geri kalanını etkilemez.
 - Her 2 dakikada bir otomatik olarak verileri yeniler ve modeli yeniden eğitir
 
 Çalıştırmak için:
@@ -20,6 +24,7 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
     streamlit run app.py
 """
 
+import base64
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +65,11 @@ KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
 
 DB_PATH = Path(__file__).resolve().parent / "predictions.db"
+
+GITHUB_REPO = "fuattonget/btc_xgboost"
+GITHUB_DATA_BRANCH = "data"
+GITHUB_DATA_PATH = "data/predictions_log.csv"
+GITHUB_SYNC_MIN_INTERVAL_MIN = 10
 
 DEFAULT_PARAM_GRID = [
     {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 200},
@@ -477,6 +487,14 @@ def get_db_connection() -> sqlite3.Connection:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
     return conn
 
 
@@ -528,6 +546,80 @@ def load_resolved_predictions(limit: int | None = None) -> pd.DataFrame:
     df = pd.read_sql_query(query, conn)
     conn.close()
     return df
+
+
+def _get_sync_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM sync_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _set_sync_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    with conn:
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def sync_predictions_to_github() -> None:
+    """Sonuçlanmış tahmin geçmişini GitHub'daki ayrı `data` branch'ine CSV olarak push eder.
+
+    Bilerek deploy edilen `main` DEĞİL, ayrı bir `data` branch'i hedeflenir: Streamlit Cloud
+    yalnızca app'e bağlı branch'e (main) push geldiğinde otomatik redeploy tetikler; `data`
+    branch'ine yazmak canlı uygulamayı yeniden başlatmaz / SQLite'ı sıfırlamaz.
+
+    `st.secrets["GITHUB_TOKEN"]` tanımlı değilse (örn. yerel geliştirmede) bu fonksiyon
+    sessizce hiçbir şey yapmaz — özellik tamamen opsiyoneldir ve eksikliği uygulamanın
+    geri kalanını etkilemez. Ağ/API hataları da yutulur (best-effort telemetri).
+    """
+    try:
+        token = st.secrets.get("GITHUB_TOKEN")
+    except Exception:
+        token = None
+    if not token:
+        return
+
+    conn = get_db_connection()
+    last_synced_str = _get_sync_state(conn, "last_synced_at")
+    now = pd.Timestamp.now(tz="UTC")
+    if last_synced_str is not None:
+        last_synced = pd.Timestamp(last_synced_str)
+        if (now - last_synced) < pd.Timedelta(minutes=GITHUB_SYNC_MIN_INTERVAL_MIN):
+            conn.close()
+            return
+
+    resolved = pd.read_sql_query(
+        "SELECT * FROM predictions WHERE resolved = 1 ORDER BY pred_time ASC", conn
+    )
+    if resolved.empty:
+        conn.close()
+        return
+
+    try:
+        csv_bytes = resolved.to_csv(index=False).encode("utf-8")
+        content_b64 = base64.b64encode(csv_bytes).decode("ascii")
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DATA_PATH}"
+
+        get_resp = requests.get(api_url, headers=headers, params={"ref": GITHUB_DATA_BRANCH}, timeout=10)
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+
+        payload = {
+            "message": f"Update prediction log ({len(resolved)} resolved predictions)",
+            "content": content_b64,
+            "branch": GITHUB_DATA_BRANCH,
+        }
+        if sha:
+            payload["sha"] = sha
+
+        put_resp = requests.put(api_url, headers=headers, json=payload, timeout=15)
+        if put_resp.status_code in (200, 201):
+            _set_sync_state(conn, "last_synced_at", now.isoformat())
+    except Exception:
+        pass  # best-effort: senkronizasyon hatası canlı uygulamayı etkilemesin
+    finally:
+        conn.close()
 
 
 def render_countdown_and_forecast_widget(target_time: pd.Timestamp, current_price: float,
@@ -633,6 +725,7 @@ future_up_prob = result["future_up_prob"] if result else None
 # ---- Tahmin doğruluk takibi: önce geçmiş tahminleri sonuçlandır, sonra yenisini kaydet
 resolve_pending_predictions(feat_df)
 log_new_prediction(latest.name, latest["close"], future_pred)
+sync_predictions_to_github()
 
 # ---- Üst metrik satırı --------------------------------------------------
 current_price = latest["close"]
