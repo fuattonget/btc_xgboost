@@ -1,0 +1,66 @@
+name: Keep BTC model collecting live data
+
+# Streamlit Community Cloud puts idle apps to sleep, and even while awake it
+# only actively runs the prediction/training loop while a browser session is
+# connected. This workflow runs the exact same pipeline (fetch -> features ->
+# CV -> train -> predict -> resolve -> log -> sync) headlessly on GitHub's own
+# infrastructure, independent of the app being visited, the user's computer,
+# or any Claude Code session. It restores the persisted SQLite DB from the
+# `data` branch before each run and writes it back after, so pending
+# predictions still get resolved correctly across runs.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore persisted predictions.db from data branch
+        run: |
+          git clone --branch data --single-branch --depth 1 \
+            https://github.com/${{ github.repository }}.git /tmp/data-restore
+          if [ -f /tmp/data-restore/data/predictions.db ]; then
+            cp /tmp/data-restore/data/predictions.db predictions.db
+            echo "Restored existing predictions.db"
+          else
+            echo "No prior predictions.db on data branch, starting fresh"
+          fi
+
+      - name: Configure GITHUB_TOKEN secret for in-app sync
+        run: |
+          mkdir -p .streamlit
+          printf 'GITHUB_TOKEN = "%s"\n' "${{ secrets.APP_GITHUB_TOKEN }}" > .streamlit/secrets.toml
+
+      - name: Run one collection cycle (fetch, train, predict, resolve, sync)
+        run: python app.py
+
+      - name: Persist predictions.db back to data branch
+        run: |
+          git clone --branch data --single-branch --depth 1 \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git /tmp/data-push
+          cp predictions.db /tmp/data-push/data/predictions.db
+          cd /tmp/data-push
+          git config user.name "btc-xgboost-collector"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/predictions.db
+          git diff --cached --quiet || git commit -m "Persist predictions.db [skip ci]"
+          git push
