@@ -7,10 +7,13 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
   Stokastik Osilatör, ATR, OBV, VWAP)
 - 15 dakikalık üst zaman dilimi verisinden "rejim" (trend bağlamı) özellikleri türetir
   (Kraken'in 1 dakikalık geçmişi ~12 saatle sınırlı; 15dk mumlarla ~7.5 günlük bağlam eklenir)
-- XGBoost regresyon modeliyle 2 dakika sonrasının GETİRİSİNİ (log-return) tahmin eder ve
-  fiyata çevirir; ayrıca yön (yukarı/aşağı) için ayrı bir XGBoost sınıflandırma modeli eğitir
+- Coinbase'den de 1 dakikalık BTC-USD verisi çekip Kraken'e karşı ÇAPRAZ-BORSA SPREAD
+  özelliği türetir — klasik fiyat-türevli indikatörlerden bağımsız bir mikro-yapı sinyali
+- XGBoost regresyon modeliyle, CV ile seçilen bir ufuktaki (aday: 2/5/10/15 dk) GETİRİYİ
+  (log-return) tahmin eder ve fiyata çevirir; ayrıca yön (yukarı/aşağı) için ayrı bir
+  XGBoost sınıflandırma modeli eğitir
 - Model performansını naive baseline (tahmin = şu anki fiyat) ile karşılaştırır
-- Walk-forward (embargo'lu) train/test ayrımı ve TimeSeriesSplit ile periyodik
+- Walk-forward (embargo'lu) train/test ayrımı ve TimeSeriesSplit ile periyodik ufuk +
   hiperparametre seçimi yapar
 - Tahmin geçmişini SQLite'a kalıcı olarak kaydeder (uygulama/sunucu yeniden başlasa bile kaybolmaz)
 - Her gerçek model eğitiminde (cache miss olduğunda) kullanılan hiperparametreleri, test
@@ -66,8 +69,12 @@ REFRESH_MS = 2 * 60 * 1000  # 2 dakikada bir otomatik yenile
 REGIME_INTERVAL_MIN = 15     # Üst zaman dilimi (rejim/bağlam özellikleri için)
 REGIME_LOOKBACK = 720          # ~7.5 gün @15m — Kraken 1m'de veremediği uzun geçmişi kısmen telafi eder
 
+COINBASE_LOOKBACK_HOURS = 13    # Kraken'in ~12 saatlik penceresini tam kapsayacak kadar (+1 saat tampon)
+COINBASE_CHUNK_HOURS = 4          # Coinbase tek istekte en fazla ~300 mum (~5 saat) döndürür
+
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 
 DB_PATH = Path(__file__).resolve().parent / "predictions.db"
 
@@ -144,6 +151,47 @@ def fetch_ticker_24h(pair: str = PAIR) -> dict:
     return {"priceChangePercent": change_pct, "volume": volume_24h}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_coinbase_klines(hours: float = COINBASE_LOOKBACK_HOURS) -> pd.DataFrame:
+    """Coinbase'den 1 dakikalık BTC-USD mumlarını çeker (çapraz-borsa spread özelliği için).
+
+    Kraken'in aksine Coinbase'in public candles endpoint'i GERÇEK geçmişe gidebiliyor
+    (test edildi: 24 saat öncesine ait mumlar sorunsuz dönüyor); tek kısıt istek başına
+    ~300 mum (~5 saat) sınırı, bu yüzden `COINBASE_CHUNK_HOURS`'luk parçalar halinde
+    sayfalanır. Coinbase erişilemezse boş DataFrame döner — çağıran taraf bunu nötr
+    (spread=0) olarak ele alır, uygulamanın geri kalanını bozmaz.
+    """
+    end = pd.Timestamp.now(tz="UTC")
+    start = end - pd.Timedelta(hours=hours)
+    chunk = pd.Timedelta(hours=COINBASE_CHUNK_HOURS)
+
+    frames = []
+    cur_start = start
+    while cur_start < end:
+        cur_end = min(cur_start + chunk, end)
+        try:
+            resp = requests.get(
+                COINBASE_CANDLES_URL,
+                params={"granularity": 60, "start": cur_start.isoformat(), "end": cur_end.isoformat()},
+                headers={"User-Agent": "btc-xgboost-app"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if isinstance(rows, list) and rows:
+                frames.append(pd.DataFrame(rows, columns=["ts", "low", "high", "open", "close", "volume"]))
+        except Exception:
+            pass  # tek bir parça başarısız olursa diğer parçalarla devam et
+        cur_start = cur_end
+
+    if not frames:
+        return pd.DataFrame(columns=["coinbase_close"])
+
+    raw = pd.concat(frames).drop_duplicates(subset="ts").sort_values("ts")
+    raw["open_time"] = pd.to_datetime(raw["ts"], unit="s", utc=True)
+    return raw.set_index("open_time")[["close"]].rename(columns={"close": "coinbase_close"})
+
+
 # ----------------------------------------------------------------------------
 # Teknik indikatörler (harici kütüphaneye ihtiyaç duymadan hesaplanır)
 # ----------------------------------------------------------------------------
@@ -216,7 +264,8 @@ def build_regime_features(regime_df: pd.DataFrame) -> pd.DataFrame:
     return out[["regime_close_vs_ema50", "regime_rsi_14", "regime_trend"]].sort_index()
 
 
-def build_features(df: pd.DataFrame, regime_feat: pd.DataFrame | None = None) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, regime_feat: pd.DataFrame | None = None,
+                    coinbase_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """OHLCV verisinden indikatörleri ve model özelliklerini üretir."""
     out = df.copy()
 
@@ -265,6 +314,21 @@ def build_features(df: pd.DataFrame, regime_feat: pd.DataFrame | None = None) ->
         for c in ["regime_close_vs_ema50", "regime_rsi_14", "regime_trend"]:
             out[c] = np.nan
 
+    # Kraken vs Coinbase fiyat farkı (çapraz-borsa spread): iki venue arasındaki
+    # kısa vadeli fiyat keşfi gecikmesini/liderliğini yakalamayı amaçlayan, klasik
+    # fiyat-türevli indikatörlerden BAĞIMSIZ bir mikro-yapı sinyali.
+    if coinbase_df is not None and not coinbase_df.empty:
+        out = pd.merge_asof(
+            out.sort_index(), coinbase_df.sort_index(),
+            left_index=True, right_index=True, direction="nearest",
+            tolerance=pd.Timedelta("2min"),
+        )
+        out["coinbase_spread"] = (out["close"] - out["coinbase_close"]) / out["coinbase_close"]
+        out.drop(columns=["coinbase_close"], inplace=True)
+    else:
+        out["coinbase_spread"] = np.nan
+    out["coinbase_spread"] = out["coinbase_spread"].fillna(0.0)
+
     return out
 
 
@@ -277,6 +341,7 @@ FEATURE_COLS = [
     "close_lag_1", "close_lag_2", "close_lag_3", "close_lag_5", "close_lag_10",
     "volume",
     "regime_close_vs_ema50", "regime_rsi_14", "regime_trend",
+    "coinbase_spread",
 ]
 
 
@@ -820,8 +885,13 @@ if fetch_error:
     )
     st.stop()
 
+try:
+    coinbase_df = fetch_coinbase_klines()
+except Exception:  # noqa: BLE001
+    coinbase_df = pd.DataFrame()  # opsiyonel özellik: Coinbase erişilemezse spread=0 ile devam et
+
 regime_feat = build_regime_features(regime_df)
-feat_df = build_features(raw_df, regime_feat)
+feat_df = build_features(raw_df, regime_feat, coinbase_df)
 latest = feat_df.iloc[-1]
 
 with st.spinner("En iyi ufuk ve hiperparametreler seçiliyor (walk-forward CV)..."):
@@ -1041,7 +1111,7 @@ indicator_table = pd.DataFrame({
     "İndikatör": [
         "EMA 9 / 21 / 50", "SMA 20", "RSI (14)", "MACD / Sinyal",
         "Bollinger Üst / Orta / Alt", "Stokastik %K / %D", "ATR (14)", "VWAP", "OBV",
-        "Rejim (15dk) Trend", "Rejim (15dk) RSI",
+        "Rejim (15dk) Trend", "Rejim (15dk) RSI", "Kraken-Coinbase Spread",
     ],
     "Değer": [
         f"{latest['ema_9']:.2f} / {latest['ema_21']:.2f} / {latest['ema_50']:.2f}",
@@ -1055,6 +1125,7 @@ indicator_table = pd.DataFrame({
         f"{latest['obv']:.0f}",
         "Yükseliş" if latest["regime_trend"] > 0 else "Düşüş",
         f"{latest['regime_rsi_14']:.2f}",
+        f"{latest['coinbase_spread']*100:+.4f}%",
     ],
 })
 st.dataframe(indicator_table, hide_index=True, use_container_width=True)
