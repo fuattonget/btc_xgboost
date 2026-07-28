@@ -5,7 +5,14 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
   ABD dahil çoğu bölgeden erişilebilir; Binance.com ABD IP'lerini 451 hatasıyla engeller)
 - En çok kullanılan trade indikatörlerini hesaplar (EMA, SMA, RSI, MACD, Bollinger Bantları,
   Stokastik Osilatör, ATR, OBV, VWAP)
-- XGBoost regresyon modeliyle 2 dakika sonrasının kapanış fiyatını tahmin eder
+- 15 dakikalık üst zaman dilimi verisinden "rejim" (trend bağlamı) özellikleri türetir
+  (Kraken'in 1 dakikalık geçmişi ~12 saatle sınırlı; 15dk mumlarla ~7.5 günlük bağlam eklenir)
+- XGBoost regresyon modeliyle 2 dakika sonrasının GETİRİSİNİ (log-return) tahmin eder ve
+  fiyata çevirir; ayrıca yön (yukarı/aşağı) için ayrı bir XGBoost sınıflandırma modeli eğitir
+- Model performansını naive baseline (tahmin = şu anki fiyat) ile karşılaştırır
+- Walk-forward (embargo'lu) train/test ayrımı ve TimeSeriesSplit ile periyodik
+  hiperparametre seçimi yapar
+- Tahmin geçmişini SQLite'a kalıcı olarak kaydeder (uygulama/sunucu yeniden başlasa bile kaybolmaz)
 - Her 2 dakikada bir otomatik olarak verileri yeniler ve modeli yeniden eğitir
 
 Çalıştırmak için:
@@ -13,8 +20,9 @@ BTC Trend Analizi & XGBoost Fiyat Tahmin Uygulaması
     streamlit run app.py
 """
 
-import time
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -24,8 +32,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
 from streamlit_autorefresh import st_autorefresh
-from xgboost import XGBRegressor
+from xgboost import XGBClassifier, XGBRegressor
 
 # ----------------------------------------------------------------------------
 # Sayfa ayarları
@@ -40,19 +49,37 @@ SYMBOL = "BTC/USD"
 PAIR = "XBTUSD"            # Kraken'de BTC/USD çifti bu şekilde adlandırılır
 INTERVAL = "1m"             # Sadece görüntüleme etiketi
 KRAKEN_INTERVAL_MIN = 1      # Kraken OHLC aralığı (dakika): 1,5,15,30,60,240,1440,10080,21600
-LOOKBACK = 720                # Kraken tek istekte en fazla ~720 mum döndürür
+LOOKBACK = 720                # Kraken tek istekte en fazla ~720 mum döndürür (~12 saat @1m)
 HORIZON = 2               # Kaç dakika sonrası tahmin edilecek (mum sayısı, 1m bar -> 2 dk)
 REFRESH_MS = 2 * 60 * 1000  # 2 dakikada bir otomatik yenile
 
+REGIME_INTERVAL_MIN = 15     # Üst zaman dilimi (rejim/bağlam özellikleri için)
+REGIME_LOOKBACK = 720          # ~7.5 gün @15m — Kraken 1m'de veremediği uzun geçmişi kısmen telafi eder
+
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
+
+DB_PATH = Path(__file__).resolve().parent / "predictions.db"
+
+DEFAULT_PARAM_GRID = [
+    {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 200},
+    {"max_depth": 4, "learning_rate": 0.05, "n_estimators": 300},
+    {"max_depth": 5, "learning_rate": 0.03, "n_estimators": 400},
+    {"max_depth": 3, "learning_rate": 0.1, "n_estimators": 150},
+]
 
 # ----------------------------------------------------------------------------
 # Veri çekme
 # ----------------------------------------------------------------------------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_klines(pair: str = PAIR, interval_min: int = KRAKEN_INTERVAL_MIN, limit: int = LOOKBACK) -> pd.DataFrame:
-    """Kraken'den OHLCV mum verisi çeker (API key gerekmez, ABD dahil çoğu ülkeden erişilebilir)."""
+    """Kraken'den OHLCV mum verisi çeker (API key gerekmez, ABD dahil çoğu ülkeden erişilebilir).
+
+    Not: Kraken'in `since` parametresi test edildi — geçmişe ne kadar gidilirse gidilsin
+    her interval için sabit ~720 mumluk pencere döner (1m'de ~12 saat). Yani sayfalama ile
+    daha fazla 1 dakikalık geçmiş elde etmek mümkün değil; bu proje bu sınırı `REGIME_INTERVAL_MIN`
+    ile telafi ediyor (bkz. build_regime_features).
+    """
     params = {"pair": pair, "interval": interval_min}
     resp = requests.get(KRAKEN_OHLC_URL, params=params, timeout=10)
     resp.raise_for_status()
@@ -160,7 +187,20 @@ def vwap(high, low, close, volume) -> pd.Series:
     return (typical_price * volume).cumsum() / volume.cumsum()
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_regime_features(regime_df: pd.DataFrame) -> pd.DataFrame:
+    """15 dakikalık üst zaman diliminden, 1 dakikalık modele "büyük resmi" (rejim/bağlam)
+    kazandıran birkaç özellik türetir. Kraken 1 dakikalık geçmişi ~12 saatle sınırlı olduğu
+    için modelin son birkaç saatin ötesini görmesinin tek yolu bu üst zaman dilimi."""
+    out = regime_df.copy()
+    ema_20 = out["close"].ewm(span=20, adjust=False).mean()
+    ema_50 = out["close"].ewm(span=50, adjust=False).mean()
+    out["regime_close_vs_ema50"] = (out["close"] - ema_50) / ema_50
+    out["regime_rsi_14"] = rsi(out["close"], 14)
+    out["regime_trend"] = np.where(ema_20 > ema_50, 1.0, -1.0)
+    return out[["regime_close_vs_ema50", "regime_rsi_14", "regime_trend"]].sort_index()
+
+
+def build_features(df: pd.DataFrame, regime_feat: pd.DataFrame | None = None) -> pd.DataFrame:
     """OHLCV verisinden indikatörleri ve model özelliklerini üretir."""
     out = df.copy()
 
@@ -200,6 +240,15 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     for lag in [1, 2, 3, 5, 10]:
         out[f"close_lag_{lag}"] = out["close"].shift(lag)
 
+    if regime_feat is not None and not regime_feat.empty:
+        out = pd.merge_asof(
+            out.sort_index(), regime_feat,
+            left_index=True, right_index=True, direction="backward",
+        )
+    else:
+        for c in ["regime_close_vs_ema50", "regime_rsi_14", "regime_trend"]:
+            out[c] = np.nan
+
     return out
 
 
@@ -211,52 +260,148 @@ FEATURE_COLS = [
     "return_1", "return_5", "return_15", "volatility_15",
     "close_lag_1", "close_lag_2", "close_lag_3", "close_lag_5", "close_lag_10",
     "volume",
+    "regime_close_vs_ema50", "regime_rsi_14", "regime_trend",
 ]
 
 
 # ----------------------------------------------------------------------------
 # Model eğitimi
 # ----------------------------------------------------------------------------
-def train_model(feat_df: pd.DataFrame, horizon: int = HORIZON):
-    """XGBoost regresyon modelini eğitir; hedef = `horizon` mum sonraki kapanış fiyatı."""
+def prepare_training_data(feat_df: pd.DataFrame, horizon: int = HORIZON) -> pd.DataFrame:
+    """Hedef değişkenleri üretir. Ham fiyat yerine LOG-RETURN hedeflenir: modelin
+    "şimdiki fiyatı kopyalayarak" düşük hata elde etmesini engeller, çünkü lag/EMA gibi
+    fiyata çok yakın özellikler artık hedefi (getiri) doğrudan açıklamıyor."""
     data = feat_df.copy()
-    data["target"] = data["close"].shift(-horizon)
-    data = data.dropna(subset=FEATURE_COLS + ["target"])
+    data["target_price"] = data["close"].shift(-horizon)
+    data["target_return"] = np.log(data["target_price"] / data["close"])
+    data["target_direction"] = (data["target_return"] > 0).astype(int)
+    data = data.dropna(subset=FEATURE_COLS + ["target_price", "target_return"])
+    return data
 
-    if len(data) < 50:
-        return None, None, None
 
+def time_series_split_with_embargo(data: pd.DataFrame, horizon: int, test_frac: float = 0.15):
+    """Kronolojik train/test ayrımı + embargo (purge) boşluğu.
+
+    Hedef `horizon` bar ileriye baktığı için, split noktasına en yakın train satırlarının
+    hedefleri test bölgesindeki fiyatlarla örtüşür. Aradaki `horizon` satırı train setinden
+    çıkararak bu örtüşmeyi (optimistik sızıntıyı) engelliyoruz.
+    """
+    n = len(data)
+    split = int(n * (1 - test_frac))
+    train_end = max(split - horizon, int(n * 0.5))
+    train = data.iloc[:train_end]
+    test = data.iloc[split:]
+    return train, test
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def select_hyperparams(feat_df: pd.DataFrame, horizon: int = HORIZON, n_splits: int = 4):
+    """TimeSeriesSplit (gap=horizon ile embargo'lu) walk-forward CV ile küçük bir grid
+    üzerinde en iyi hiperparametreleri seçer. Sonuç 30 dakika cache'lenir; her 2 dakikalık
+    otomatik yenilemede tekrar grid-search çalıştırmak gereksiz ve maliyetlidir."""
+    data = prepare_training_data(feat_df, horizon)
     X = data[FEATURE_COLS]
-    y = data["target"]
+    y = data["target_return"]
 
-    split = int(len(X) * 0.85)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    n_splits_eff = min(n_splits, max(2, len(data) // 100))
+    tscv = TimeSeriesSplit(n_splits=n_splits_eff, gap=horizon)
 
-    model = XGBRegressor(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        objective="reg:squarederror",
-        n_jobs=-1,
+    rows = []
+    for params in DEFAULT_PARAM_GRID:
+        fold_maes = []
+        for train_idx, test_idx in tscv.split(X):
+            X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
+            y_tr = y.iloc[train_idx]
+            m = XGBRegressor(
+                objective="reg:squarederror", subsample=0.8, colsample_bytree=0.8,
+                reg_lambda=1.0, random_state=42, n_jobs=-1, **params,
+            )
+            m.fit(X_tr, y_tr)
+            pred_return = m.predict(X_te)
+            current_price = data["close"].iloc[test_idx].values
+            pred_price = current_price * np.exp(pred_return)
+            actual_price = data["target_price"].iloc[test_idx].values
+            fold_maes.append(mean_absolute_error(actual_price, pred_price))
+        rows.append({**params, "cv_mae": float(np.mean(fold_maes))})
+
+    report = pd.DataFrame(rows).sort_values("cv_mae").reset_index(drop=True)
+    best_row = report.iloc[0]
+    best_params = {
+        "max_depth": int(best_row["max_depth"]),
+        "learning_rate": float(best_row["learning_rate"]),
+        "n_estimators": int(best_row["n_estimators"]),
+    }
+    return best_params, report
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def train_model(feat_df: pd.DataFrame, horizon: int, params: dict):
+    """Regresyon (fiyat/getiri) + sınıflandırma (yön) modellerini eğitir; naive baseline'a
+    karşı test seti performansını ölçer. `feat_df`/`horizon`/`params` değişmediği sürece
+    (yani yeni mum verisi gelmediği sürece) cache'den döner — her Streamlit rerun'unda
+    sıfırdan eğitim yapılmaz."""
+    data = prepare_training_data(feat_df, horizon)
+    if len(data) < 100:
+        return None
+
+    train, test = time_series_split_with_embargo(data, horizon)
+    if len(train) < 50 or len(test) < 5:
+        return None
+
+    X_train, y_train = train[FEATURE_COLS], train["target_return"]
+    X_test = test[FEATURE_COLS]
+
+    reg = XGBRegressor(
+        objective="reg:squarederror", subsample=0.8, colsample_bytree=0.8,
+        reg_lambda=1.0, random_state=42, n_jobs=-1, **params,
     )
-    model.fit(X_train, y_train)
+    reg.fit(X_train, y_train)
 
-    metrics = {}
-    if len(X_test) > 0:
-        preds_test = model.predict(X_test)
-        metrics["mae"] = mean_absolute_error(y_test, preds_test)
-        metrics["rmse"] = np.sqrt(mean_squared_error(y_test, preds_test))
-        metrics["n_test"] = len(X_test)
+    pred_return_test = reg.predict(X_test)
+    current_price_test = test["close"].values
+    pred_price_test = current_price_test * np.exp(pred_return_test)
+    actual_price_test = test["target_price"].values
 
-    # Son satırdan geleceğe dair tahmin (target NaN olan en güncel satır)
+    mae_model = float(mean_absolute_error(actual_price_test, pred_price_test))
+    rmse_model = float(np.sqrt(mean_squared_error(actual_price_test, pred_price_test)))
+    mae_naive = float(mean_absolute_error(actual_price_test, current_price_test))
+    edge_vs_naive_pct = (mae_naive - mae_model) / mae_naive * 100 if mae_naive else 0.0
+
+    pred_dir = np.sign(pred_price_test - current_price_test)
+    actual_dir = np.sign(actual_price_test - current_price_test)
+    direction_acc = float(np.mean((pred_dir == actual_dir) | (actual_dir == 0)))
+
+    clf = XGBClassifier(
+        max_depth=params["max_depth"], learning_rate=params["learning_rate"],
+        n_estimators=params["n_estimators"], subsample=0.8, colsample_bytree=0.8,
+        reg_lambda=1.0, random_state=42, n_jobs=-1, eval_metric="logloss",
+    )
+    clf.fit(train[FEATURE_COLS], train["target_direction"])
+    clf_test_acc = float(clf.score(X_test, test["target_direction"]))
+
     last_row = feat_df.dropna(subset=FEATURE_COLS).iloc[[-1]][FEATURE_COLS]
-    future_pred = model.predict(last_row)[0]
+    current_price = float(feat_df["close"].iloc[-1])
+    future_return = float(reg.predict(last_row)[0])
+    future_pred = current_price * np.exp(future_return)
+    future_up_prob = float(clf.predict_proba(last_row)[0][1])
 
-    return model, metrics, future_pred
+    metrics = {
+        "mae": mae_model,
+        "rmse": rmse_model,
+        "mae_naive": mae_naive,
+        "edge_vs_naive_pct": edge_vs_naive_pct,
+        "n_test": int(len(test)),
+        "direction_acc": direction_acc,
+        "clf_test_acc": clf_test_acc,
+    }
+
+    return {
+        "model": reg,
+        "clf_model": clf,
+        "metrics": metrics,
+        "future_pred": future_pred,
+        "future_up_prob": future_up_prob,
+    }
 
 
 def trend_signal(latest: pd.Series) -> tuple[str, str]:
@@ -314,77 +459,80 @@ def trend_signal(latest: pd.Series) -> tuple[str, str]:
 
 
 # ----------------------------------------------------------------------------
-# Tahmin doğruluk takibi (canlı backtest)
+# Tahmin doğruluk takibi (canlı backtest) — SQLite'a kalıcı olarak yazılır
 # ----------------------------------------------------------------------------
-def log_new_prediction(feat_df: pd.DataFrame, latest: pd.Series, current_price: float,
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions (
+            pred_time TEXT PRIMARY KEY,
+            target_time TEXT NOT NULL,
+            horizon INTEGER NOT NULL,
+            price_at_pred REAL NOT NULL,
+            predicted_price REAL NOT NULL,
+            actual_price REAL,
+            actual_time TEXT,
+            resolved INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    return conn
+
+
+def log_new_prediction(latest_time: pd.Timestamp, current_price: float,
                         future_pred: float, horizon: int = HORIZON) -> None:
-    """Yeni yapılan tahmini session_state'e kaydeder (aynı bar için tekrar kaydetmez)."""
-    log = st.session_state.setdefault("prediction_log", [])
-
-    pred_time = latest.name  # bu barın zaman damgası (tz-aware)
-    if log and log[-1]["pred_time"] == pred_time:
-        return  # bu bar için zaten kayıt var, tekrar ekleme
-
+    """Yeni yapılan tahmini SQLite'a kaydeder (aynı bar için tekrar kaydetmez, uygulama
+    yeniden başlasa bile geçmiş korunur)."""
     if future_pred is None:
         return
-
-    target_time = pred_time + pd.Timedelta(minutes=horizon)
-    log.append({
-        "pred_time": pred_time,
-        "target_time": target_time,
-        "price_at_pred": float(current_price),
-        "predicted_price": float(future_pred),
-        "actual_price": None,
-        "actual_time": None,
-        "resolved": False,
-    })
-    # Log'un çok büyümesini önle
-    if len(log) > 300:
-        del log[: len(log) - 300]
+    target_time = latest_time + pd.Timedelta(minutes=horizon)
+    conn = get_db_connection()
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO predictions "
+            "(pred_time, target_time, horizon, price_at_pred, predicted_price) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (latest_time.isoformat(), target_time.isoformat(), horizon,
+             float(current_price), float(future_pred)),
+        )
+    conn.close()
 
 
 def resolve_pending_predictions(feat_df: pd.DataFrame) -> None:
     """Hedef zamanı geçmiş, henüz sonuçlanmamış tahminleri gerçekleşen fiyatla eşleştirir."""
-    log = st.session_state.get("prediction_log", [])
-    for entry in log:
-        if entry["resolved"]:
-            continue
-        matching = feat_df[feat_df.index >= entry["target_time"]]
+    conn = get_db_connection()
+    pending = conn.execute(
+        "SELECT pred_time, target_time FROM predictions WHERE resolved = 0"
+    ).fetchall()
+    for pred_time_str, target_time_str in pending:
+        target_time = pd.Timestamp(target_time_str)
+        matching = feat_df[feat_df.index >= target_time]
         if matching.empty:
             continue
         actual_row = matching.iloc[0]
-        entry["actual_price"] = float(actual_row["close"])
-        entry["actual_time"] = matching.index[0]
-        entry["resolved"] = True
+        with conn:
+            conn.execute(
+                "UPDATE predictions SET actual_price = ?, actual_time = ?, resolved = 1 "
+                "WHERE pred_time = ?",
+                (float(actual_row["close"]), matching.index[0].isoformat(), pred_time_str),
+            )
+    conn.close()
 
 
-def prediction_accuracy_summary() -> pd.DataFrame | None:
-    """Sonuçlanmış tahminlerden bir özet tablo üretir."""
-    log = st.session_state.get("prediction_log", [])
-    resolved = [e for e in log if e["resolved"]]
-    if not resolved:
-        return None
-
-    rows = []
-    for e in resolved[-30:][::-1]:  # en yeni en üstte, son 30 tahmin
-        error_abs = abs(e["actual_price"] - e["predicted_price"])
-        error_pct = error_abs / e["actual_price"] * 100
-        pred_dir = np.sign(e["predicted_price"] - e["price_at_pred"])
-        actual_dir = np.sign(e["actual_price"] - e["price_at_pred"])
-        direction_ok = "✅" if (pred_dir == actual_dir or actual_dir == 0) else "❌"
-        rows.append({
-            "Tahmin Zamanı (UTC)": e["pred_time"].strftime("%H:%M:%S"),
-            "O Anki Fiyat": f"${e['price_at_pred']:,.2f}",
-            "Tahmin Edilen": f"${e['predicted_price']:,.2f}",
-            "Gerçekleşen": f"${e['actual_price']:,.2f}",
-            "Hata": f"${error_abs:,.2f} ({error_pct:.3f}%)",
-            "Yön Doğru mu?": direction_ok,
-        })
-    return pd.DataFrame(rows)
+def load_resolved_predictions(limit: int | None = None) -> pd.DataFrame:
+    conn = get_db_connection()
+    query = "SELECT * FROM predictions WHERE resolved = 1 ORDER BY pred_time DESC"
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
 
 def render_countdown_and_forecast_widget(target_time: pd.Timestamp, current_price: float,
-                                          future_pred: float, refresh_ms: int) -> None:
+                                          future_pred: float, refresh_ms: int,
+                                          up_prob: float | None = None) -> None:
     """Sonraki yenilemeye kalan süreyi sayan ve modelin ne zamana kadar
     yükseliş/düşüş beklediğini gösteren küçük bir HTML/JS widget'ı render eder."""
     target_iso = target_time.isoformat()
@@ -398,6 +546,7 @@ def render_countdown_and_forecast_widget(target_time: pd.Timestamp, current_pric
         direction_word, arrow, color = "YATAY", "→", "#6b7280"
 
     pct_change = (future_pred - current_price) / current_price * 100
+    prob_suffix = f" &middot; sınıflandırıcı: %{up_prob * 100:.0f} yukarı" if up_prob is not None else ""
 
     html = f"""
     <div style="display:flex; gap:16px; flex-wrap:wrap; font-family:inherit;">
@@ -411,7 +560,7 @@ def render_countdown_and_forecast_widget(target_time: pd.Timestamp, current_pric
         <div style="font-size:13px; opacity:0.7; margin-bottom:4px;">📊 Model Ne Bekliyor?</div>
         <div style="font-size:18px; font-weight:700; color:{color};">
           {arrow} <span id="target-time">--:--:--</span> saatine (yerel saat) kadar {direction_word}
-          <span style="font-weight:500; font-size:15px;">({pct_change:+.3f}%)</span>
+          <span style="font-weight:500; font-size:15px;">({pct_change:+.3f}%{prob_suffix})</span>
         </div>
       </div>
     </div>
@@ -452,11 +601,12 @@ st.caption(
 
 with st.spinner("Canlı BTC verisi çekiliyor..."):
     try:
-        raw_df = fetch_klines()
+        raw_df = fetch_klines(PAIR, KRAKEN_INTERVAL_MIN, LOOKBACK)
+        regime_df = fetch_klines(PAIR, REGIME_INTERVAL_MIN, REGIME_LOOKBACK)
         ticker = fetch_ticker_24h()
         fetch_error = None
     except Exception as exc:  # noqa: BLE001
-        raw_df, ticker, fetch_error = None, None, str(exc)
+        raw_df, regime_df, ticker, fetch_error = None, None, None, str(exc)
 
 if fetch_error:
     st.error(
@@ -465,22 +615,31 @@ if fetch_error:
     )
     st.stop()
 
-feat_df = build_features(raw_df)
+regime_feat = build_regime_features(regime_df)
+feat_df = build_features(raw_df, regime_feat)
 latest = feat_df.iloc[-1]
 
-with st.spinner("XGBoost modeli eğitiliyor ve tahmin hesaplanıyor..."):
-    model, metrics, future_pred = train_model(feat_df)
+with st.spinner("Hiperparametreler seçiliyor (walk-forward CV)..."):
+    best_params, cv_report = select_hyperparams(feat_df, HORIZON)
+
+with st.spinner("XGBoost modelleri eğitiliyor ve tahmin hesaplanıyor..."):
+    result = train_model(feat_df, HORIZON, best_params)
+
+model = result["model"] if result else None
+metrics = result["metrics"] if result else None
+future_pred = result["future_pred"] if result else None
+future_up_prob = result["future_up_prob"] if result else None
 
 # ---- Tahmin doğruluk takibi: önce geçmiş tahminleri sonuçlandır, sonra yenisini kaydet
 resolve_pending_predictions(feat_df)
-log_new_prediction(feat_df, latest, latest["close"], future_pred)
+log_new_prediction(latest.name, latest["close"], future_pred)
 
 # ---- Üst metrik satırı --------------------------------------------------
 current_price = latest["close"]
 change_24h_pct = float(ticker["priceChangePercent"])
 volume_24h = float(ticker["volume"])
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Güncel Fiyat", f"${current_price:,.2f}", f"{change_24h_pct:+.2f}% (24s)")
 
 if future_pred is not None:
@@ -494,24 +653,57 @@ if future_pred is not None:
 else:
     col2.metric(f"{HORIZON} Dakika Sonrası Tahmin", "Yetersiz veri", "—")
 
+if future_up_prob is not None:
+    col3.metric("Sınıflandırıcı: Yukarı Olasılığı", f"%{future_up_prob * 100:.1f}")
+else:
+    col3.metric("Sınıflandırıcı: Yukarı Olasılığı", "—")
+
 label, reasons = trend_signal(latest)
-col3.metric("Kural Tabanlı Trend Sinyali", label)
+col4.metric("Kural Tabanlı Trend Sinyali", label)
 
 if metrics:
-    col4.metric("Model Hata Payı (MAE)", f"${metrics['mae']:,.2f}", f"RMSE: ${metrics['rmse']:,.2f}")
+    col5.metric(
+        "Model MAE (Naive'e Karşı)",
+        f"${metrics['mae']:,.2f}",
+        f"{metrics['edge_vs_naive_pct']:+.1f}% (naive: ${metrics['mae_naive']:,.2f})",
+    )
 else:
-    col4.metric("Model Hata Payı (MAE)", "—")
+    col5.metric("Model MAE (Naive'e Karşı)", "—")
 
 st.info(f"**Sinyal gerekçeleri:** {reasons}")
 
+if metrics:
+    edge = metrics["edge_vs_naive_pct"]
+    if edge <= 0:
+        st.warning(
+            f"⚠️ Model, test setinde naive baseline'ı (tahmin = şu anki fiyat) **geçemiyor** "
+            f"(edge: {edge:+.1f}%). Bu ufukta ({HORIZON} dk) modelin fiyat hareketinden bağımsız "
+            "bilgi çıkaramadığı anlamına gelir — tahminlere temkinli yaklaşın."
+        )
+    else:
+        st.success(
+            f"✅ Model, test setinde naive baseline'ı **{edge:.1f}%** oranında geçiyor. "
+            f"Yön isabet oranı: %{metrics['direction_acc'] * 100:.1f} • "
+            f"Sınıflandırıcı isabet oranı: %{metrics['clf_test_acc'] * 100:.1f} "
+            "(rastgele/coin-flip taban: %50)."
+        )
+
 if future_pred is not None:
     target_time = latest.name + pd.Timedelta(minutes=HORIZON)
-    render_countdown_and_forecast_widget(target_time, current_price, future_pred, REFRESH_MS)
+    render_countdown_and_forecast_widget(target_time, current_price, future_pred, REFRESH_MS, future_up_prob)
 
 st.caption(
     f"Son güncelleme (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} — "
     "Bu uygulama yatırım tavsiyesi değildir, eğitim/analiz amaçlıdır."
 )
+
+with st.expander("🔧 Hiperparametre Seçimi (Walk-Forward CV, 30 dk'da bir yenilenir)"):
+    st.caption(
+        "TimeSeriesSplit (embargo=horizon) ile küçük bir grid taranır; en düşük ortalama "
+        "CV-MAE'ye sahip kombinasyon seçilir."
+    )
+    st.dataframe(cv_report, hide_index=True, use_container_width=True)
+    st.write(f"**Seçilen parametreler:** {best_params}")
 
 st.divider()
 
@@ -550,40 +742,47 @@ fig.update_layout(height=900, xaxis_rangeslider_visible=False, legend=dict(orien
 st.plotly_chart(fig, use_container_width=True)
 
 # ---- Tahmin doğruluk takibi (canlı backtest) -----------------------------
-st.subheader("🎯 Tahmin Doğruluk Takibi (Canlı Backtest)")
+st.subheader("🎯 Tahmin Doğruluk Takibi (Canlı Backtest, SQLite'ta kalıcı)")
 st.caption(
     "Her yenilemede, bir önceki döngüde yapılan tahmin artık gerçekleşen fiyatla "
-    "karşılaştırılıp burada gösterilir. Uygulamayı açık bıraktıkça bu liste büyür."
+    "karşılaştırılıp burada gösterilir. Bu geçmiş SQLite'a yazılır; uygulamayı/sunucuyu "
+    "yeniden başlatsanız bile kaybolmaz ve zamanla birikir."
 )
 
-resolved_log = [e for e in st.session_state.get("prediction_log", []) if e["resolved"]]
+resolved_df = load_resolved_predictions()
 
-if not resolved_log:
+if resolved_df.empty:
     st.warning(
         "Henüz sonuçlanmış bir tahmin yok. İlk tahminin sonucu, tahmin edilen "
         f"{HORIZON} dakikalık süre dolduktan sonraki ilk yenilemede burada görünecek."
     )
 else:
-    errors_pct = [
-        abs(e["actual_price"] - e["predicted_price"]) / e["actual_price"] * 100
-        for e in resolved_log
-    ]
-    errors_abs = [abs(e["actual_price"] - e["predicted_price"]) for e in resolved_log]
-    direction_hits = [
-        1 if (np.sign(e["predicted_price"] - e["price_at_pred"])
-              == np.sign(e["actual_price"] - e["price_at_pred"])
-              or e["actual_price"] == e["price_at_pred"]) else 0
-        for e in resolved_log
-    ]
+    errors_abs = (resolved_df["actual_price"] - resolved_df["predicted_price"]).abs()
+    errors_pct = errors_abs / resolved_df["actual_price"] * 100
+    pred_dir = np.sign(resolved_df["predicted_price"] - resolved_df["price_at_pred"])
+    actual_dir = np.sign(resolved_df["actual_price"] - resolved_df["price_at_pred"])
+    direction_hits = ((pred_dir == actual_dir) | (actual_dir == 0)).astype(int)
 
     acc_col1, acc_col2, acc_col3, acc_col4 = st.columns(4)
-    acc_col1.metric("Sonuçlanan Tahmin Sayısı", len(resolved_log))
-    acc_col2.metric("Ortalama Mutlak Hata", f"${np.mean(errors_abs):,.2f}")
-    acc_col3.metric("Ortalama Yüzde Hata", f"{np.mean(errors_pct):.3f}%")
-    acc_col4.metric("Yön İsabet Oranı", f"{np.mean(direction_hits) * 100:.1f}%")
+    acc_col1.metric("Sonuçlanan Tahmin Sayısı (tüm zamanlar)", len(resolved_df))
+    acc_col2.metric("Ortalama Mutlak Hata", f"${errors_abs.mean():,.2f}")
+    acc_col3.metric("Ortalama Yüzde Hata", f"{errors_pct.mean():.3f}%")
+    acc_col4.metric("Yön İsabet Oranı", f"{direction_hits.mean() * 100:.1f}%")
 
-    acc_table = prediction_accuracy_summary()
-    st.dataframe(acc_table, hide_index=True, use_container_width=True)
+    display_df = resolved_df.head(30).copy()
+    display_df["Tahmin Zamanı (UTC)"] = pd.to_datetime(display_df["pred_time"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    display_df["O Anki Fiyat"] = display_df["price_at_pred"].map(lambda v: f"${v:,.2f}")
+    display_df["Tahmin Edilen"] = display_df["predicted_price"].map(lambda v: f"${v:,.2f}")
+    display_df["Gerçekleşen"] = display_df["actual_price"].map(lambda v: f"${v:,.2f}")
+    display_df["Hata"] = [
+        f"${a:,.2f} ({p:.3f}%)" for a, p in zip(errors_abs.head(30), errors_pct.head(30))
+    ]
+    display_df["Yön Doğru mu?"] = ["✅" if h else "❌" for h in direction_hits.head(30)]
+
+    st.dataframe(
+        display_df[["Tahmin Zamanı (UTC)", "O Anki Fiyat", "Tahmin Edilen", "Gerçekleşen", "Hata", "Yön Doğru mu?"]],
+        hide_index=True, use_container_width=True,
+    )
 
 st.divider()
 
@@ -593,6 +792,7 @@ indicator_table = pd.DataFrame({
     "İndikatör": [
         "EMA 9 / 21 / 50", "SMA 20", "RSI (14)", "MACD / Sinyal",
         "Bollinger Üst / Orta / Alt", "Stokastik %K / %D", "ATR (14)", "VWAP", "OBV",
+        "Rejim (15dk) Trend", "Rejim (15dk) RSI",
     ],
     "Değer": [
         f"{latest['ema_9']:.2f} / {latest['ema_21']:.2f} / {latest['ema_50']:.2f}",
@@ -604,6 +804,8 @@ indicator_table = pd.DataFrame({
         f"{latest['atr_14']:.2f}",
         f"{latest['vwap']:.2f}",
         f"{latest['obv']:.0f}",
+        "Yükseliş" if latest["regime_trend"] > 0 else "Düşüş",
+        f"{latest['regime_rsi_14']:.2f}",
     ],
 })
 st.dataframe(indicator_table, hide_index=True, use_container_width=True)
@@ -617,6 +819,7 @@ if model is not None:
     st.plotly_chart(fig_imp, use_container_width=True)
 
 st.caption(
-    "Not: Model her 2 dakikalık yenilemede en güncel 1000 mumluk pencere üzerinde yeniden eğitilir. "
+    "Not: Model her 2 dakikalık yenilemede en güncel pencere üzerinde yeniden eğitilir; "
+    "hedef ham fiyat değil log-getiri olarak tanımlanır ve naive baseline ile karşılaştırılır. "
     "Kripto piyasaları yüksek oynaklığa sahiptir; bu araç finansal tavsiye değildir."
 )
