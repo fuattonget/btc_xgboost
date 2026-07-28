@@ -59,7 +59,8 @@ PAIR = "XBTUSD"            # Kraken'de BTC/USD çifti bu şekilde adlandırılı
 INTERVAL = "1m"             # Sadece görüntüleme etiketi
 KRAKEN_INTERVAL_MIN = 1      # Kraken OHLC aralığı (dakika): 1,5,15,30,60,240,1440,10080,21600
 LOOKBACK = 720                # Kraken tek istekte en fazla ~720 mum döndürür (~12 saat @1m)
-HORIZON = 2               # Kaç dakika sonrası tahmin edilecek (mum sayısı, 1m bar -> 2 dk)
+HORIZON = 2               # Varsayılan/fallback ufuk (mum sayısı, 1m bar -> dakika)
+HORIZON_CANDIDATES = [2, 5, 10, 15]  # Karşılaştırılacak tahmin ufukları (dakika)
 REFRESH_MS = 2 * 60 * 1000  # 2 dakikada bir otomatik yenile
 
 REGIME_INTERVAL_MIN = 15     # Üst zaman dilimi (rejim/bağlam özellikleri için)
@@ -310,43 +311,72 @@ def time_series_split_with_embargo(data: pd.DataFrame, horizon: int, test_frac: 
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def select_hyperparams(feat_df: pd.DataFrame, horizon: int = HORIZON, n_splits: int = 4):
-    """TimeSeriesSplit (gap=horizon ile embargo'lu) walk-forward CV ile küçük bir grid
-    üzerinde en iyi hiperparametreleri seçer. Sonuç 30 dakika cache'lenir; her 2 dakikalık
-    otomatik yenilemede tekrar grid-search çalıştırmak gereksiz ve maliyetlidir."""
-    data = prepare_training_data(feat_df, horizon)
-    X = data[FEATURE_COLS]
-    y = data["target_return"]
+def select_horizon_and_hyperparams(feat_df: pd.DataFrame, horizon_candidates: tuple = tuple(HORIZON_CANDIDATES),
+                                    n_splits: int = 4):
+    """Birden fazla tahmin ufkunu (ör. 2/5/10/15 dk) VE her ufuk için küçük bir hiperparametre
+    grid'ini TimeSeriesSplit (gap=horizon ile embargo'lu) walk-forward CV ile tarar.
 
-    n_splits_eff = min(n_splits, max(2, len(data) // 100))
-    tscv = TimeSeriesSplit(n_splits=n_splits_eff, gap=horizon)
-
+    Sabit 2 dakikalık ufuk neredeyse rastgele yürüyüşe (random walk) çok yakın olduğu için
+    modelin gerçek bir edge bulma şansı düşüktü — canlı sonuçlar da bunu doğruladı (naive
+    baseline'ın altında kalıyordu). Seçim kriteri ham CV-MAE değil, naive baseline'a göre
+    EDGE YÜZDESİ: farklı ufuklarda fiyat farkının mutlak büyüklüğü doğal olarak değiştiği
+    için MAE'ler doğrudan karşılaştırılamaz, ama "naive'e göre ne kadar iyi/kötü" ölçeksiz
+    ve karşılaştırılabilir bir metriktir. Sonuç 30 dakika cache'lenir.
+    """
     rows = []
-    for params in DEFAULT_PARAM_GRID:
-        fold_maes = []
-        for train_idx, test_idx in tscv.split(X):
-            X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-            y_tr = y.iloc[train_idx]
-            m = XGBRegressor(
-                objective="reg:squarederror", subsample=0.8, colsample_bytree=0.8,
-                reg_lambda=1.0, random_state=42, n_jobs=-1, **params,
-            )
-            m.fit(X_tr, y_tr)
-            pred_return = m.predict(X_te)
-            current_price = data["close"].iloc[test_idx].values
-            pred_price = current_price * np.exp(pred_return)
-            actual_price = data["target_price"].iloc[test_idx].values
-            fold_maes.append(mean_absolute_error(actual_price, pred_price))
-        rows.append({**params, "cv_mae": float(np.mean(fold_maes))})
+    for horizon in horizon_candidates:
+        data = prepare_training_data(feat_df, horizon)
+        if len(data) < 150:
+            continue
 
-    report = pd.DataFrame(rows).sort_values("cv_mae").reset_index(drop=True)
+        X = data[FEATURE_COLS]
+        y = data["target_return"]
+        n_splits_eff = min(n_splits, max(2, len(data) // 100))
+        tscv = TimeSeriesSplit(n_splits=n_splits_eff, gap=horizon)
+
+        for params in DEFAULT_PARAM_GRID:
+            fold_maes, fold_naive_maes, fold_dir_accs = [], [], []
+            for train_idx, test_idx in tscv.split(X):
+                X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
+                y_tr = y.iloc[train_idx]
+                m = XGBRegressor(
+                    objective="reg:squarederror", subsample=0.8, colsample_bytree=0.8,
+                    reg_lambda=1.0, random_state=42, n_jobs=-1, **params,
+                )
+                m.fit(X_tr, y_tr)
+                pred_return = m.predict(X_te)
+                current_price = data["close"].iloc[test_idx].values
+                pred_price = current_price * np.exp(pred_return)
+                actual_price = data["target_price"].iloc[test_idx].values
+
+                fold_maes.append(mean_absolute_error(actual_price, pred_price))
+                fold_naive_maes.append(mean_absolute_error(actual_price, current_price))
+                pred_dir = np.sign(pred_price - current_price)
+                actual_dir = np.sign(actual_price - current_price)
+                fold_dir_accs.append(float(np.mean((pred_dir == actual_dir) | (actual_dir == 0))))
+
+            cv_mae = float(np.mean(fold_maes))
+            cv_naive_mae = float(np.mean(fold_naive_maes))
+            cv_edge_pct = (cv_naive_mae - cv_mae) / cv_naive_mae * 100 if cv_naive_mae else 0.0
+            rows.append({
+                "horizon": horizon, **params,
+                "cv_mae": cv_mae, "cv_naive_mae": cv_naive_mae,
+                "cv_edge_vs_naive_pct": cv_edge_pct,
+                "cv_direction_acc": float(np.mean(fold_dir_accs)),
+            })
+
+    report = pd.DataFrame(rows).sort_values("cv_edge_vs_naive_pct", ascending=False).reset_index(drop=True)
+    if report.empty:
+        return HORIZON, DEFAULT_PARAM_GRID[1], report
+
     best_row = report.iloc[0]
+    best_horizon = int(best_row["horizon"])
     best_params = {
         "max_depth": int(best_row["max_depth"]),
         "learning_rate": float(best_row["learning_rate"]),
         "n_estimators": int(best_row["n_estimators"]),
     }
-    return best_params, report
+    return best_horizon, best_params, report
 
 
 @st.cache_data(ttl=90, show_spinner=False)
@@ -770,7 +800,8 @@ st_autorefresh(interval=REFRESH_MS, key="auto_refresh")
 st.title("₿ BTC/USD Trend Analizi & XGBoost Fiyat Tahmini")
 st.caption(
     f"Veri kaynağı: Kraken Public API • Mum aralığı: {INTERVAL} • "
-    f"Tahmin ufku: {HORIZON} dakika • Otomatik yenileme: 2 dakikada bir"
+    f"Tahmin ufku: adaptif (CV ile {min(HORIZON_CANDIDATES)}-{max(HORIZON_CANDIDATES)} dk arasından seçilir) • "
+    "Otomatik yenileme: 2 dakikada bir"
 )
 
 with st.spinner("Canlı BTC verisi çekiliyor..."):
@@ -793,11 +824,11 @@ regime_feat = build_regime_features(regime_df)
 feat_df = build_features(raw_df, regime_feat)
 latest = feat_df.iloc[-1]
 
-with st.spinner("Hiperparametreler seçiliyor (walk-forward CV)..."):
-    best_params, cv_report = select_hyperparams(feat_df, HORIZON)
+with st.spinner("En iyi ufuk ve hiperparametreler seçiliyor (walk-forward CV)..."):
+    best_horizon, best_params, cv_report = select_horizon_and_hyperparams(feat_df)
 
 with st.spinner("XGBoost modelleri eğitiliyor ve tahmin hesaplanıyor..."):
-    result = train_model(feat_df, HORIZON, best_params)
+    result = train_model(feat_df, best_horizon, best_params)
 
 model = result["model"] if result else None
 metrics = result["metrics"] if result else None
@@ -806,7 +837,7 @@ future_up_prob = result["future_up_prob"] if result else None
 
 # ---- Tahmin doğruluk takibi: önce geçmiş tahminleri sonuçlandır, sonra yenisini kaydet
 resolve_pending_predictions(feat_df)
-log_new_prediction(latest.name, latest["close"], future_pred)
+log_new_prediction(latest.name, latest["close"], future_pred, horizon=best_horizon)
 sync_logs_to_github()
 
 # ---- Üst metrik satırı --------------------------------------------------
@@ -821,12 +852,12 @@ if future_pred is not None:
     delta = future_pred - current_price
     delta_pct = delta / current_price * 100
     col2.metric(
-        f"{HORIZON} Dakika Sonrası Tahmin",
+        f"{best_horizon} Dakika Sonrası Tahmin",
         f"${future_pred:,.2f}",
         f"{delta_pct:+.3f}%",
     )
 else:
-    col2.metric(f"{HORIZON} Dakika Sonrası Tahmin", "Yetersiz veri", "—")
+    col2.metric(f"{best_horizon} Dakika Sonrası Tahmin", "Yetersiz veri", "—")
 
 if future_up_prob is not None:
     col3.metric("Sınıflandırıcı: Yukarı Olasılığı", f"%{future_up_prob * 100:.1f}")
@@ -852,8 +883,9 @@ if metrics:
     if edge <= 0:
         st.warning(
             f"⚠️ Model, test setinde naive baseline'ı (tahmin = şu anki fiyat) **geçemiyor** "
-            f"(edge: {edge:+.1f}%). Bu ufukta ({HORIZON} dk) modelin fiyat hareketinden bağımsız "
-            "bilgi çıkaramadığı anlamına gelir — tahminlere temkinli yaklaşın."
+            f"(edge: {edge:+.1f}%). Bu ufukta ({best_horizon} dk — {len(HORIZON_CANDIDATES)} aday "
+            "arasından CV ile seçildi) modelin fiyat hareketinden bağımsız bilgi çıkaramadığı "
+            "anlamına gelir — tahminlere temkinli yaklaşın."
         )
     else:
         st.success(
@@ -864,7 +896,7 @@ if metrics:
         )
 
 if future_pred is not None:
-    target_time = latest.name + pd.Timedelta(minutes=HORIZON)
+    target_time = latest.name + pd.Timedelta(minutes=best_horizon)
     render_countdown_and_forecast_widget(target_time, current_price, future_pred, REFRESH_MS, future_up_prob)
 
 st.caption(
@@ -872,13 +904,15 @@ st.caption(
     "Bu uygulama yatırım tavsiyesi değildir, eğitim/analiz amaçlıdır."
 )
 
-with st.expander("🔧 Hiperparametre Seçimi (Walk-Forward CV, 30 dk'da bir yenilenir)"):
+with st.expander(f"🔧 Ufuk & Hiperparametre Seçimi (Walk-Forward CV, {HORIZON_CANDIDATES} dk aday, 30 dk'da bir yenilenir)"):
     st.caption(
-        "TimeSeriesSplit (embargo=horizon) ile küçük bir grid taranır; en düşük ortalama "
-        "CV-MAE'ye sahip kombinasyon seçilir."
+        "Her ufuk adayı için TimeSeriesSplit (embargo=horizon) ile küçük bir grid taranır; "
+        "naive baseline'a göre EN YÜKSEK edge yüzdesine sahip (ufuk, hiperparametre) "
+        "kombinasyonu seçilir — ham MAE değil, çünkü farklı ufuklarda MAE doğrudan "
+        "karşılaştırılamaz."
     )
     st.dataframe(cv_report, hide_index=True, use_container_width=True)
-    st.write(f"**Seçilen parametreler:** {best_params}")
+    st.write(f"**Seçilen ufuk:** {best_horizon} dakika • **Seçilen parametreler:** {best_params}")
 
 with st.expander("📚 Eğitim Geçmişi (Hiperparametreler, Hata Oranları, Özellik Önemi) — SQLite'ta kalıcı"):
     st.caption(
@@ -961,7 +995,7 @@ resolved_df = load_resolved_predictions()
 if resolved_df.empty:
     st.warning(
         "Henüz sonuçlanmış bir tahmin yok. İlk tahminin sonucu, tahmin edilen "
-        f"{HORIZON} dakikalık süre dolduktan sonraki ilk yenilemede burada görünecek."
+        f"{best_horizon} dakikalık süre dolduktan sonraki ilk yenilemede burada görünecek."
     )
 else:
     errors_abs = (resolved_df["actual_price"] - resolved_df["predicted_price"]).abs()
@@ -978,6 +1012,7 @@ else:
 
     display_df = resolved_df.head(30).copy()
     display_df["Tahmin Zamanı (UTC)"] = pd.to_datetime(display_df["pred_time"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    display_df["Ufuk (dk)"] = display_df["horizon"]
     display_df["O Anki Fiyat"] = display_df["price_at_pred"].map(lambda v: f"${v:,.2f}")
     display_df["Tahmin Edilen"] = display_df["predicted_price"].map(lambda v: f"${v:,.2f}")
     display_df["Gerçekleşen"] = display_df["actual_price"].map(lambda v: f"${v:,.2f}")
@@ -986,8 +1021,15 @@ else:
     ]
     display_df["Yön Doğru mu?"] = ["✅" if h else "❌" for h in direction_hits.head(30)]
 
+    st.caption(
+        "Not: Ufuk zaman içinde CV sonucuna göre değişebildiği için farklı satırlar farklı "
+        "dakika ufuklarına ait olabilir (bkz. \"Ufuk (dk)\" kolonu)."
+    )
     st.dataframe(
-        display_df[["Tahmin Zamanı (UTC)", "O Anki Fiyat", "Tahmin Edilen", "Gerçekleşen", "Hata", "Yön Doğru mu?"]],
+        display_df[[
+            "Tahmin Zamanı (UTC)", "Ufuk (dk)", "O Anki Fiyat", "Tahmin Edilen",
+            "Gerçekleşen", "Hata", "Yön Doğru mu?",
+        ]],
         hide_index=True, use_container_width=True,
     )
 
